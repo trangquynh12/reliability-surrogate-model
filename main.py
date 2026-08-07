@@ -91,7 +91,7 @@ def run_reliability(req: ReliabilityRequest) -> ReliabilityResponse:
 
     g = R - E
     n_fail = int(np.sum(g < 0))
-    Pf = max(n_fail / req.N, 0.5 / req.N)
+    Pf = min(max(n_fail / req.N, 0.5 / req.N), 1 - 0.5 / req.N)
     beta = float(-norm.ppf(Pf))
     cov_Pf = float(np.sqrt((1 - Pf) / (Pf * req.N))) if Pf > 0 else None
 
