@@ -268,7 +268,13 @@ def compute_form(
         # Positive = safe
         # Negative = failure
         g = float(R - E)
-
+g_variance = float(np.var(g))
+    if g_variance < 1e-6:
+        # Genuine warning, not a crash — surfaces the degenerate-limit-state
+        # problem explicitly instead of silently reporting a misleading beta.
+        print(f"WARNING: Var[g] = {g_variance:.2e} at t={req.timeStep_years} — "
+              f"limit state is nearly deterministic. Check that capacity/demand "
+              f"formulas reference enough genuinely random variables.")
         return g
 
     # --------------------------------------------------------
