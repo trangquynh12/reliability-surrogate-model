@@ -1,10 +1,24 @@
+"""
+Structural Reliability Service
+================================
+FastAPI microservice that computes structural reliability (Pf, beta)
+via direct Monte Carlo simulation, using verified closed-form capacity
+and demand formulas supplied by the Recipe Agent (not hardcoded here).
+
+Endpoints:
+  POST /reliability - run direct Monte Carlo reliability analysis
+  GET  /health       - health check
+"""
+
 import numpy as np
 from scipy.stats import norm
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict
 
-app = FastAPI(title="Structural Reliability Service", version="3.0.0")
+app = FastAPI(title="Structural Reliability Service", version="3.1.0")
+
+EULER_GAMMA = 0.5772156649015329  # Euler-Mascheroni constant, for Gumbel conversion
 
 
 class RandomVariableSpec(BaseModel):
@@ -18,16 +32,14 @@ class ReliabilityRequest(BaseModel):
     timeStep_years: float
 
     # ── Supplied by the Recipe Agent — the executable law, NOT hardcoded here ──
-    capacity_formula: str          # e.g. "A_s * (f_yk/1.15) * (d_mm - (A_s*(f_yk/1.15))/(2*0.85*f_ck*b_mm)) / 1e6"
-    demand_formula: str            # e.g. "B_D * demand_dead_mean_kNm + B_L * demand_live_mean_kNm"
-    corrosion_formula: Optional[str] = None   # e.g. "max(0.05, 1 - k_A*max(0, t-T_i))" — multiplies a named variable
+    capacity_formula: str
+    demand_formula: str
+    corrosion_formula: Optional[str] = None
 
     # ── Random variables — distribution model from Recipe Agent (JCSS/code) ──
     variables: Dict[str, RandomVariableSpec]
 
     # ── Fixed, deterministic values — auto-mapped from IFC geometry + Excel ──
-    # (per-member values: b_mm, d_mm, f_ck, demand_dead_mean_kNm, ... — whatever
-    # the formula strings above reference by name)
     fixed_params: Dict[str, float]
 
 
@@ -46,18 +58,34 @@ class ReliabilityResponse(BaseModel):
 SAFE_GLOBALS = {
     "__builtins__": {},
     "np": np,
-    "max": np.maximum,   # vectorized max, so formulas can write max(0, x) on arrays
+    "max": np.maximum,
     "min": np.minimum,
 }
 
 
 def sample_variable(spec: RandomVariableSpec, N: int, rng) -> np.ndarray:
     if spec.dist == "normal":
+        # scale IS the standard deviation directly — already correct.
         return rng.normal(spec.mean, spec.mean * spec.cov, size=N)
+
     if spec.dist == "lognormal":
-        return rng.lognormal(mean=np.log(spec.mean), sigma=spec.cov, size=N)
+        # Convert arithmetic (mean, CoV) -> lognormal's own (mu_ln, sigma_ln)
+        # parameters, so the SAMPLED distribution actually has the intended
+        # arithmetic mean and CoV — not a biased approximation.
+        sigma_ln = np.sqrt(np.log(1 + spec.cov ** 2))
+        mu_ln = np.log(spec.mean) - 0.5 * sigma_ln ** 2
+        return rng.lognormal(mean=mu_ln, sigma=sigma_ln, size=N)
+
     if spec.dist == "gumbel":
-        return rng.gumbel(loc=spec.mean, scale=spec.cov, size=N)
+        # NumPy's gumbel(loc, scale) has mean = loc + scale*EULER_GAMMA and
+        # std = scale*pi/sqrt(6). "scale" is an ABSOLUTE dispersion (same
+        # units as the variable), NOT the CoV. Convert properly from
+        # arithmetic (mean, CoV) instead of passing CoV as scale directly.
+        std = spec.mean * spec.cov
+        scale = std * np.sqrt(6) / np.pi
+        loc = spec.mean - scale * EULER_GAMMA
+        return rng.gumbel(loc=loc, scale=scale, size=N)
+
     raise HTTPException(400, f"Unsupported distribution type: {spec.dist}")
 
 
@@ -77,15 +105,13 @@ def run_reliability(req: ReliabilityRequest) -> ReliabilityResponse:
     # 2. Merge sampled arrays + fixed deterministic params + time step into ONE namespace
     namespace = {**sampled, **req.fixed_params, "t": req.timeStep_years}
 
-    # 3. Apply corrosion degradation, if the recipe includes one, to whichever
-    #    variable it targets (the formula itself decides — e.g. multiplies A_s)
+    # 3. Apply corrosion degradation, if the recipe includes one
     if req.corrosion_formula:
         namespace["degradation_factor"] = safe_eval_formula(req.corrosion_formula, namespace)
     else:
         namespace["degradation_factor"] = 1.0
 
-    # 4. Evaluate demand and capacity — BOTH formulas come from the Recipe Agent,
-    #    not from any code written in this service.
+    # 4. Evaluate demand and capacity — BOTH formulas come from the Recipe Agent
     E = safe_eval_formula(req.demand_formula, namespace)
     R = safe_eval_formula(req.capacity_formula, namespace)
 
