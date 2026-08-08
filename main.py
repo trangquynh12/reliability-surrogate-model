@@ -1,49 +1,26 @@
-"""
-Structural Reliability Service  v5.0.0
-========================================
-FastAPI microservice — POST /reliability runs:
-  1. Direct Monte Carlo (crude MC)
-  2. FORM (HL-RF + Rackwitz-Fiessler) as cross-check
-
-Fixes applied vs v4.0.0:
-  FIX 1 — g_variance block removed from g_func (caused NameError on every
-           FORM iteration → form_converged=False always)
-  FIX 2 — capacity formula note: z must be in mm when dividing by 1e6,
-           OR in m when dividing by 1e3. Both give kNm. The formula
-           supplied by the Recipe Agent must be consistent with its units.
-  FIX 3 — corrosion applied to A_p via degradation_factor in the capacity
-           formula: "theta_R * (A_p * degradation_factor) * f_ps * z / 1e6"
-  FIX 4 — g_variance check moved to run_reliability() where g is a vector,
-           so np.var(g) is meaningful. Emits a warning but never blocks.
-
-Endpoints:
-  POST /reliability  — run MC + FORM reliability analysis
-  GET  /health       — health check
-"""
-
 import numpy as np
 from scipy.stats import norm, lognorm, gumbel_r
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict
 
-app = FastAPI(title="Structural Reliability Service", version="5.0.0")
 
-EULER_GAMMA = 0.5772156649015329
+# ============================================================
+# APP
+# ============================================================
 
-# Only safe math symbols — no builtins, no file I/O
-SAFE_GLOBALS = {
-    "__builtins__": {},
-    "np": np,
-    "max": np.maximum,
-    "min": np.minimum,
-}
+app = FastAPI(
+    title="Structural Reliability Service",
+    version="4.0.0"
+)
 
 
-# ── Pydantic models ──────────────────────────────────────────────────────────
+# ============================================================
+# INPUT MODELS
+# ============================================================
 
 class RandomVariableSpec(BaseModel):
-    dist: str        # "normal" | "lognormal" | "gumbel"
+    dist: str
     mean: float
     cov: float
 
@@ -51,426 +28,1250 @@ class RandomVariableSpec(BaseModel):
 class ReliabilityRequest(BaseModel):
     N: int
     timeStep_years: float
+
+    # Supplied by Recipe Agent
     capacity_formula: str
     demand_formula: str
     corrosion_formula: Optional[str] = None
+
+    # Random variables
     variables: Dict[str, RandomVariableSpec]
+
+    # Deterministic parameters
     fixed_params: Dict[str, float]
 
+
+# ============================================================
+# OUTPUT MODEL
+# ============================================================
 
 class ReliabilityResponse(BaseModel):
     timeStep_years: float
     N: int
+
     n_fail: int
+
     Pf: float
     beta: float
+
     cov_Pf: Optional[float]
+
     mean_capacity_kNm: float
     mean_demand_kNm: float
 
-    # True when n_fail=0 — beta is only a floor value (0.5/N), not resolved
-    is_floor_value: bool
+    # FORM
+    beta_FORM: Optional[float]
+    Pf_FORM: Optional[float]
+    FORM_converged: bool
 
-    # FORM cross-check — valid even when MC observes zero failures
-    beta_FORM: Optional[float] = None
-    Pf_FORM: Optional[float] = None
-    form_converged: bool = False
-
-    # Governing beta — FORM when MC is unreliable, min(MC,FORM) otherwise
-    governing_beta: float
-    governing_source: str     # "FORM" | "MC" | "min(MC,FORM)"
+    FORM_g_residual: Optional[float]
+    FORM_u_norm: Optional[float]
+    FORM_iterations: int
 
 
-# ── Distribution helpers ─────────────────────────────────────────────────────
+# ============================================================
+# SAFE EVAL
+# ============================================================
 
-def sample_variable(spec: RandomVariableSpec, N: int, rng) -> np.ndarray:
-    """Draw N samples from the given distribution."""
-    if spec.dist == "normal":
-        return rng.normal(spec.mean, spec.mean * spec.cov, size=N)
-    if spec.dist == "lognormal":
-        sigma_ln = np.sqrt(np.log(1 + spec.cov ** 2))
-        mu_ln    = np.log(spec.mean) - 0.5 * sigma_ln ** 2
-        return rng.lognormal(mean=mu_ln, sigma=sigma_ln, size=N)
-    if spec.dist == "gumbel":
-        std   = spec.mean * spec.cov
-        scale = std * np.sqrt(6) / np.pi
-        loc   = spec.mean - scale * EULER_GAMMA
-        return rng.gumbel(loc=loc, scale=scale, size=N)
-    raise HTTPException(400, f"Unsupported distribution: '{spec.dist}'. Use normal/lognormal/gumbel.")
+SAFE_GLOBALS = {
+    "__builtins__": {},
+    "np": np,
+    "max": np.maximum,
+    "min": np.minimum,
+    "abs": np.abs,
+}
 
 
-def get_scipy_dist(spec: RandomVariableSpec):
-    """Frozen scipy distribution — same parameterization as sample_variable()."""
-    if spec.dist == "normal":
-        return norm(loc=spec.mean, scale=spec.mean * spec.cov)
-    if spec.dist == "lognormal":
-        sigma_ln = np.sqrt(np.log(1 + spec.cov ** 2))
-        mu_ln    = np.log(spec.mean) - 0.5 * sigma_ln ** 2
-        return lognorm(s=sigma_ln, scale=np.exp(mu_ln))
-    if spec.dist == "gumbel":
-        std   = spec.mean * spec.cov
-        scale = std * np.sqrt(6) / np.pi
-        loc   = spec.mean - scale * EULER_GAMMA
-        return gumbel_r(loc=loc, scale=scale)
-    raise HTTPException(400, f"Unsupported distribution: '{spec.dist}'.")
-
-
-def safe_eval(formula: str, namespace: dict):
+def safe_eval_formula(
+    formula: str,
+    namespace: dict
+):
     try:
-        return eval(formula, SAFE_GLOBALS, namespace)
+        result = eval(
+            formula,
+            SAFE_GLOBALS,
+            namespace
+        )
+
+        return result
+
     except Exception as e:
-        raise HTTPException(400, f"Error evaluating formula '{formula}': {e}")
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Error evaluating formula "
+                f"'{formula}': {e}"
+            )
+        )
 
 
-# ── FORM ─────────────────────────────────────────────────────────────────────
+# ============================================================
+# DISTRIBUTION CONVERSION
+# ============================================================
 
-def rackwitz_fiessler(dist, x: float):
-    """
-    Rackwitz-Fiessler equivalent normal transformation at point x.
-    Returns (mu_N, sigma_N) — the equivalent normal mean and std.
-    """
-    p      = float(np.clip(dist.cdf(x), 1e-12, 1 - 1e-12))
-    z      = float(norm.ppf(p))
-    pdf_x  = float(max(dist.pdf(x), 1e-300))
-    phi_z  = float(norm.pdf(z))
-    sigma_N = float(max(phi_z / pdf_x, 1e-12))
-    mu_N    = x - sigma_N * z
-    return mu_N, sigma_N
+EULER_GAMMA = 0.5772156649015329
 
 
-def compute_form(
-    variables: Dict[str, RandomVariableSpec],
-    fixed_params: dict,
-    capacity_formula: str,
-    demand_formula: str,
-    corrosion_formula: Optional[str],
-    t: float,
-    max_iter: int = 100,
-    tol_beta: float = 1e-5,
-    tol_u: float = 1e-5,
-    tol_g: float = 1e-6,
+def get_scipy_dist(
+    spec: RandomVariableSpec
 ):
     """
-    Hasofer-Lind / Rackwitz-Fiessler FORM.
+    Convert:
 
-    Limit state: g(X) = R(X,t) - E(X)
-      g > 0  safe
-      g = 0  limit state
-      g < 0  failure
+        arithmetic mean
+        COV
 
-    Returns (beta_FORM, Pf_FORM, converged).
+    into a scipy probability distribution.
     """
-    names  = list(variables.keys())
-    n_var  = len(names)
-    if n_var == 0:
-        raise HTTPException(400, "FORM requires at least one random variable.")
 
-    dists = {name: get_scipy_dist(variables[name]) for name in names}
+    dist_name = spec.dist.lower()
 
-    # ── Limit-state function (scalar evaluation, used inside FORM iterations) ──
-    def g_func(x_vec: np.ndarray) -> float:
-        ns = {name: float(x_vec[i]) for i, name in enumerate(names)}
-        ns.update(fixed_params)
-        ns["t"] = float(t)
-        # Corrosion degradation factor — evaluated once per call
-        # FIX 1: NO g_variance check here (scalar g → np.var always 0)
-        #         The variance check is in run_reliability() where g is a vector.
-        ns["degradation_factor"] = (
-            float(safe_eval(corrosion_formula, ns))
-            if corrosion_formula else 1.0
-        )
-        R = safe_eval(capacity_formula, ns)
-        E = safe_eval(demand_formula, ns)
-        return float(R - E)
+    mean = float(spec.mean)
+    cov = float(spec.cov)
 
-    # ── Check initial point ──
-    x = np.array([variables[name].mean for name in names], dtype=float)
-    g_initial = g_func(x)
-    if not np.isfinite(g_initial):
-        raise HTTPException(400, f"FORM: initial g(X_mean) is not finite ({g_initial}).")
+    if cov < 0:
 
-    u         = np.zeros(n_var, dtype=float)
-    beta_prev = np.inf
-    converged = False
-
-    for _iteration in range(max_iter):
-
-        # A. Rackwitz-Fiessler equivalent normal at current x
-        mu_N    = np.zeros(n_var)
-        sigma_N = np.zeros(n_var)
-        for i, name in enumerate(names):
-            mu_N[i], sigma_N[i] = rackwitz_fiessler(dists[name], float(x[i]))
-
-        # B. Transform physical x → standard normal u
-        u = (x - mu_N) / sigma_N
-        if not np.all(np.isfinite(u)):
-            break
-
-        # C. Evaluate limit state at x
-        g0 = g_func(x)
-        if not np.isfinite(g0):
-            break
-
-        # D. Numerical gradient ∂g/∂x (central differences)
-        grad_x = np.zeros(n_var)
-        for i in range(n_var):
-            h = max(abs(float(x[i])) * 1e-5, 1e-7)
-            xp = x.copy(); xm = x.copy()
-            xp[i] += h;    xm[i] -= h
-            gp = g_func(xp); gm = g_func(xm)
-            if np.isfinite(gp) and np.isfinite(gm):
-                grad_x[i] = (gp - gm) / (2.0 * h)
-
-        # E. Gradient in u-space: ∂g/∂u = (∂g/∂x) · σ_N
-        grad_u    = grad_x * sigma_N
-        norm_grad = float(np.linalg.norm(grad_u))
-        if not np.isfinite(norm_grad) or norm_grad < 1e-12:
-            break
-
-        # F. HL-RF update rule
-        u_new = ((np.dot(grad_u, u) - g0) / (norm_grad ** 2)) * grad_u
-        if not np.all(np.isfinite(u_new)):
-            break
-
-        # G. Back-transform u_new → physical x_new
-        x_new = mu_N + sigma_N * u_new
-        if not np.all(np.isfinite(x_new)):
-            break
-
-        # H. Reliability index at new point
-        beta_new = float(np.linalg.norm(u_new))
-
-        # I. Evaluate limit state at x_new (convergence check)
-        g_new = g_func(x_new)
-        if not np.isfinite(g_new):
-            break
-
-        # J. Convergence: all three criteria must be met simultaneously
-        delta_beta = abs(beta_new - beta_prev) if np.isfinite(beta_prev) else np.inf
-        delta_u    = float(np.linalg.norm(u_new - u))
-
-        if delta_beta < tol_beta and delta_u < tol_u and abs(g_new) < tol_g:
-            x         = x_new
-            u         = u_new
-            converged = True
-            break
-
-        x         = x_new
-        u         = u_new
-        beta_prev = beta_new
-
-    # ── Final result ──
-    beta_form = float(np.linalg.norm(u))
-    if not np.isfinite(beta_form):
-        raise HTTPException(400, "FORM failed: non-finite reliability index.")
-
-    # Pf = Phi(-beta)  [beta is positive distance from origin to MPP]
-    Pf_FORM = float(norm.cdf(-beta_form))
-    return beta_form, Pf_FORM, converged
-
-
-# ── Main computation ─────────────────────────────────────────────────────────
-
-def run_reliability(req: ReliabilityRequest) -> ReliabilityResponse:
-    """
-    1. Draw N samples (seeded for reproducibility).
-    2. Evaluate capacity, demand, limit state.
-    3. FIX 4: Check Var[g] HERE (g is a vector — np.var is meaningful).
-    4. Compute MC-based Pf and beta.
-    5. Run FORM as cross-check.
-    6. Select governing beta.
-    """
-    rng = np.random.default_rng(seed=42)  # seeded — reproducible
-
-    # ── Step 1: Sample all random variables ──
-    sampled = {
-        name: sample_variable(spec, req.N, rng)
-        for name, spec in req.variables.items()
-    }
-
-    namespace = {**sampled, **req.fixed_params, "t": req.timeStep_years}
-
-    # ── Step 2: Corrosion degradation factor (vector) ──
-    if req.corrosion_formula:
-        namespace["degradation_factor"] = safe_eval(req.corrosion_formula, namespace)
-    else:
-        namespace["degradation_factor"] = 1.0
-
-    # ── Step 3: Capacity and demand (vectors) ──
-    R = safe_eval(req.capacity_formula, namespace)
-    E = safe_eval(req.demand_formula,   namespace)
-    g = R - E
-
-    # ── FIX 4: Var[g] check — NOW meaningful because g is a vector ──
-    g_variance = float(np.var(g))
-    if g_variance < 1e-6:
-        print(
-            f"WARNING: Var[g] = {g_variance:.2e} at t={req.timeStep_years} yr — "
-            f"limit state is nearly deterministic. Verify that capacity/demand "
-            f"formulas reference the random variables, and that corrosion "
-            f"degradation_factor is applied to A_p in the capacity formula."
+        raise HTTPException(
+            status_code=400,
+            detail=f"COV cannot be negative: {cov}"
         )
 
-    # ── Step 4: Monte Carlo Pf and beta ──
-    n_fail      = int(np.sum(g < 0))
-    is_floor    = (n_fail == 0)
+    # ========================================================
+    # NORMAL
+    # ========================================================
 
-    # Laplace correction — avoids log(0) at both ends
-    Pf   = float(np.clip(n_fail / req.N, 0.5 / req.N, 1.0 - 0.5 / req.N))
-    beta = float(-norm.ppf(Pf))
+    if dist_name == "normal":
 
-    # Coefficient of variation of Pf estimate
-    cov_Pf = float(np.sqrt((1.0 - Pf) / (Pf * req.N))) if Pf > 0 else None
+        sigma = abs(mean) * cov
 
-    # ── Step 5: FORM cross-check ──
-    try:
-        beta_FORM, Pf_FORM, form_converged = compute_form(
-            req.variables,
-            req.fixed_params,
-            req.capacity_formula,
-            req.demand_formula,
-            req.corrosion_formula,
-            req.timeStep_years,
+        return norm(
+            loc=mean,
+            scale=max(sigma, 1e-12)
         )
-    except Exception as exc:
-        print(f"FORM failed at t={req.timeStep_years}: {exc}")
-        beta_FORM, Pf_FORM, form_converged = None, None, False
 
-    # ── Step 6: Governing beta selection ──
+    # ========================================================
+    # LOGNORMAL
     #
-    # Rule (from supervisor guidelines):
-    #   - If MC has < 30 failures → statistically unreliable → use FORM if converged
-    #   - If MC has >= 30 failures AND FORM converged → use min(MC, FORM) [conservative]
-    #   - If FORM did not converge → use MC only
+    # Arithmetic mean:
     #
-    mc_reliable   = n_fail >= 30
-    form_ok       = form_converged and beta_FORM is not None and np.isfinite(beta_FORM)
+    #     m
+    #
+    # COV:
+    #
+    #     v
+    #
+    # Underlying normal:
+    #
+    #     sigma_ln = sqrt(log(1 + v^2))
+    #
+    #     mu_ln = log(m) - 0.5*sigma_ln^2
+    # ========================================================
 
-    if not mc_reliable and form_ok:
-        governing_beta   = beta_FORM
-        governing_source = "FORM"
-    elif mc_reliable and form_ok:
-        governing_beta   = min(beta, beta_FORM)
-        governing_source = "min(MC,FORM)"
-    else:
-        governing_beta   = beta
-        governing_source = "MC"
+    if dist_name == "lognormal":
 
-    return ReliabilityResponse(
-        timeStep_years    = req.timeStep_years,
-        N                 = req.N,
-        n_fail            = n_fail,
-        Pf                = Pf,
-        beta              = beta,
-        cov_Pf            = cov_Pf,
-        mean_capacity_kNm = float(np.mean(R)),
-        mean_demand_kNm   = float(np.mean(E)),
-        is_floor_value    = is_floor,
-        beta_FORM         = beta_FORM,
-        Pf_FORM           = Pf_FORM,
-        form_converged    = form_converged,
-        governing_beta    = governing_beta,
-        governing_source  = governing_source,
+        if mean <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Lognormal variable requires "
+                    f"mean > 0. Got {mean}"
+                )
+            )
+
+        sigma_ln = np.sqrt(
+            np.log(
+                1.0 + cov ** 2
+            )
+        )
+
+        mu_ln = (
+            np.log(mean)
+            - 0.5 * sigma_ln ** 2
+        )
+
+        return lognorm(
+            s=sigma_ln,
+            scale=np.exp(mu_ln)
+        )
+
+    # ========================================================
+    # GUMBEL
+    #
+    # For scipy gumbel_r:
+    #
+    # mean = loc + gamma*scale
+    #
+    # std = pi/sqrt(6)*scale
+    # ========================================================
+
+    if dist_name == "gumbel":
+
+        if mean <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Gumbel variable requires "
+                    f"positive mean. Got {mean}"
+                )
+            )
+
+        std = mean * cov
+
+        scale = (
+            std
+            * np.sqrt(6.0)
+            / np.pi
+        )
+
+        loc = (
+            mean
+            - EULER_GAMMA * scale
+        )
+
+        return gumbel_r(
+            loc=loc,
+            scale=max(scale, 1e-12)
+        )
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Unsupported distribution type: "
+            f"{spec.dist}"
+        )
     )
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+# ============================================================
+# MONTE CARLO SAMPLING
+# ============================================================
+
+def sample_variable(
+    spec: RandomVariableSpec,
+    N: int,
+    rng
+) -> np.ndarray:
+
+    dist_name = spec.dist.lower()
+
+    mean = float(spec.mean)
+    cov = float(spec.cov)
+
+    # ========================================================
+    # NORMAL
+    # ========================================================
+
+    if dist_name == "normal":
+
+        sigma = abs(mean) * cov
+
+        return rng.normal(
+            loc=mean,
+            scale=max(sigma, 1e-12),
+            size=N
+        )
+
+    # ========================================================
+    # LOGNORMAL
+    #
+    # IMPORTANT:
+    #
+    # numpy.lognormal() takes the parameters of the
+    # underlying NORMAL distribution.
+    #
+    # It does NOT take arithmetic mean and COV.
+    # ========================================================
+
+    if dist_name == "lognormal":
+
+        if mean <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Lognormal variable requires "
+                    f"mean > 0. Got {mean}"
+                )
+            )
+
+        sigma_ln = np.sqrt(
+            np.log(
+                1.0 + cov ** 2
+            )
+        )
+
+        mu_ln = (
+            np.log(mean)
+            - 0.5 * sigma_ln ** 2
+        )
+
+        return rng.lognormal(
+            mean=mu_ln,
+            sigma=sigma_ln,
+            size=N
+        )
+
+    # ========================================================
+    # GUMBEL
+    # ========================================================
+
+    if dist_name == "gumbel":
+
+        if mean <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Gumbel variable requires "
+                    f"positive mean. Got {mean}"
+                )
+            )
+
+        std = mean * cov
+
+        scale = (
+            std
+            * np.sqrt(6.0)
+            / np.pi
+        )
+
+        loc = (
+            mean
+            - EULER_GAMMA * scale
+        )
+
+        return rng.gumbel(
+            loc=loc,
+            scale=max(scale, 1e-12),
+            size=N
+        )
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Unsupported distribution type: "
+            f"{spec.dist}"
+        )
+    )
+
+
+# ============================================================
+# LIMIT STATE FUNCTION
+# ============================================================
+
+def make_limit_state_function(
+    variables,
+    fixed_params,
+    capacity_formula,
+    demand_formula,
+    corrosion_formula,
+    t
+):
+    """
+    Limit-state function:
+
+        g(X) = R(X) - E(X)
+
+    Failure:
+
+        g(X) < 0
+    """
+
+    names = list(
+        variables.keys()
+    )
+
+    def g_func(
+        x_vec: np.ndarray
+    ) -> float:
+
+        namespace = {}
+
+        for i, name in enumerate(names):
+
+            namespace[name] = float(
+                x_vec[i]
+            )
+
+        # Add deterministic values
+        namespace.update(
+            fixed_params
+        )
+
+        # Time
+        namespace["t"] = float(t)
+
+        # ====================================================
+        # CORROSION
+        # ====================================================
+
+        if corrosion_formula:
+
+            degradation_factor = (
+                safe_eval_formula(
+                    corrosion_formula,
+                    namespace
+                )
+            )
+
+            namespace[
+                "degradation_factor"
+            ] = degradation_factor
+
+        else:
+
+            namespace[
+                "degradation_factor"
+            ] = 1.0
+
+        # ====================================================
+        # CAPACITY
+        # ====================================================
+
+        R = safe_eval_formula(
+            capacity_formula,
+            namespace
+        )
+
+        # ====================================================
+        # DEMAND
+        # ====================================================
+
+        E = safe_eval_formula(
+            demand_formula,
+            namespace
+        )
+
+        # ====================================================
+        # LIMIT STATE
+        # ====================================================
+
+        return float(
+            R - E
+        )
+
+    return g_func
+
+
+# ============================================================
+# RACKWITZ-FIESSLER TRANSFORMATION
+# ============================================================
+
+def rackwitz_fiessler_equivalent_normal(
+    dist,
+    x
+):
+    """
+    Determine equivalent normal distribution at x.
+
+    Match:
+
+        CDF
+        PDF
+    """
+
+    # --------------------------------------------------------
+    # CDF
+    # --------------------------------------------------------
+
+    p = float(
+        np.clip(
+            dist.cdf(x),
+            1e-12,
+            1.0 - 1e-12
+        )
+    )
+
+    # --------------------------------------------------------
+    # Equivalent normal z
+    # --------------------------------------------------------
+
+    z = float(
+        norm.ppf(p)
+    )
+
+    # --------------------------------------------------------
+    # Original PDF
+    # --------------------------------------------------------
+
+    pdf_x = max(
+        float(dist.pdf(x)),
+        1e-300
+    )
+
+    # --------------------------------------------------------
+    # Equivalent sigma
+    #
+    # sigma_N = phi(z) / f_X(x)
+    # --------------------------------------------------------
+
+    sigma_N = (
+        norm.pdf(z)
+        / pdf_x
+    )
+
+    sigma_N = max(
+        sigma_N,
+        1e-12
+    )
+
+    # --------------------------------------------------------
+    # Equivalent mean
+    #
+    # x = mu_N + sigma_N*z
+    #
+    # therefore:
+    #
+    # mu_N = x - sigma_N*z
+    # --------------------------------------------------------
+
+    mu_N = (
+        x
+        - sigma_N * z
+    )
+
+    return (
+        float(mu_N),
+        float(sigma_N)
+    )
+
+
+# ============================================================
+# NUMERICAL GRADIENT
+# ============================================================
+
+def numerical_gradient(
+    g_func,
+    x
+):
+    """
+    Central finite difference.
+    """
+
+    n = len(x)
+
+    grad = np.zeros(
+        n,
+        dtype=float
+    )
+
+    for i in range(n):
+
+        h = max(
+            abs(x[i]) * 1e-5,
+            1e-6
+        )
+
+        x_plus = x.copy()
+        x_minus = x.copy()
+
+        x_plus[i] += h
+        x_minus[i] -= h
+
+        g_plus = g_func(
+            x_plus
+        )
+
+        g_minus = g_func(
+            x_minus
+        )
+
+        grad[i] = (
+            g_plus
+            - g_minus
+        ) / (
+            2.0 * h
+        )
+
+    return grad
+
+
+# ============================================================
+# FORM
+# ============================================================
+
+def compute_form(
+    variables,
+    fixed_params,
+    capacity_formula,
+    demand_formula,
+    corrosion_formula,
+    t,
+    max_iter=100,
+    tol_beta=1e-4,
+    tol_u=1e-4,
+    tol_g=1e-3
+):
+    """
+    Rackwitz-Fiessler / HL-RF FORM.
+
+    g(X) = R(X) - E(X)
+
+    Failure:
+
+        g < 0
+
+    FORM result:
+
+        beta_FORM
+        Pf_FORM = Phi(-beta_FORM)
+    """
+
+    names = list(
+        variables.keys()
+    )
+
+    # --------------------------------------------------------
+    # scipy distributions
+    # --------------------------------------------------------
+
+    dists = {
+        name: get_scipy_dist(
+            variables[name]
+        )
+        for name in names
+    }
+
+    # --------------------------------------------------------
+    # Limit-state function
+    # --------------------------------------------------------
+
+    g_func = make_limit_state_function(
+        variables=variables,
+        fixed_params=fixed_params,
+        capacity_formula=capacity_formula,
+        demand_formula=demand_formula,
+        corrosion_formula=corrosion_formula,
+        t=t
+    )
+
+    # --------------------------------------------------------
+    # Initial point
+    #
+    # Start at physical means.
+    # --------------------------------------------------------
+
+    x = np.array(
+        [
+            variables[name].mean
+            for name in names
+        ],
+        dtype=float
+    )
+
+    beta_prev = 0.0
+
+    converged = False
+
+    final_u = None
+    final_g = None
+
+    iteration_count = 0
+
+    # ========================================================
+    # HL-RF LOOP
+    # ========================================================
+
+    for iteration in range(
+        1,
+        max_iter + 1
+    ):
+
+        iteration_count = iteration
+
+        # ----------------------------------------------------
+        # 1. Equivalent normal distributions
+        # ----------------------------------------------------
+
+        mu_N = np.zeros(
+            len(names)
+        )
+
+        sigma_N = np.zeros(
+            len(names)
+        )
+
+        for i, name in enumerate(names):
+
+            (
+                mu_N[i],
+                sigma_N[i]
+            ) = (
+                rackwitz_fiessler_equivalent_normal(
+                    dists[name],
+                    x[i]
+                )
+            )
+
+        # ----------------------------------------------------
+        # 2. Current standard normal coordinates
+        # ----------------------------------------------------
+
+        u = (
+            x - mu_N
+        ) / sigma_N
+
+        # ----------------------------------------------------
+        # 3. Current g
+        # ----------------------------------------------------
+
+        g0 = g_func(
+            x
+        )
+
+        if not np.isfinite(g0):
+
+            break
+
+        # ----------------------------------------------------
+        # 4. Gradient in physical space
+        # ----------------------------------------------------
+
+        grad_x = numerical_gradient(
+            g_func,
+            x
+        )
+
+        if not np.all(
+            np.isfinite(grad_x)
+        ):
+
+            break
+
+        # ----------------------------------------------------
+        # 5. Gradient in u-space
+        #
+        # dg/du = dg/dx * dx/du
+        #
+        # dx/du = sigma_N
+        # ----------------------------------------------------
+
+        grad_u = (
+            grad_x
+            * sigma_N
+        )
+
+        norm_grad = np.linalg.norm(
+            grad_u
+        )
+
+        if (
+            not np.isfinite(norm_grad)
+            or norm_grad < 1e-12
+        ):
+
+            break
+
+        # ----------------------------------------------------
+        # 6. Direction cosine
+        #
+        # Keep one consistent sign convention:
+        #
+        # alpha = grad_g / |grad_g|
+        # ----------------------------------------------------
+
+        alpha = (
+            grad_u
+            / norm_grad
+        )
+
+        # ----------------------------------------------------
+        # 7. HL-RF beta
+        #
+        # beta =
+        #
+        # alpha.u - g/|grad g|
+        # ----------------------------------------------------
+
+        beta_new = (
+            np.dot(
+                alpha,
+                u
+            )
+            - (
+                g0
+                / norm_grad
+            )
+        )
+
+        if not np.isfinite(
+            beta_new
+        ):
+
+            break
+
+        # ----------------------------------------------------
+        # 8. New design point
+        # ----------------------------------------------------
+
+        u_new = (
+            beta_new
+            * alpha
+        )
+
+        # ----------------------------------------------------
+        # 9. Transform back to physical space
+        # ----------------------------------------------------
+
+        x_new = (
+            mu_N
+            + sigma_N * u_new
+        )
+
+        if not np.all(
+            np.isfinite(x_new)
+        ):
+
+            break
+
+        # ----------------------------------------------------
+        # 10. New limit-state value
+        # ----------------------------------------------------
+
+        g_new = g_func(
+            x_new
+        )
+
+        if not np.isfinite(
+            g_new
+        ):
+
+            break
+
+        # ----------------------------------------------------
+        # 11. Convergence metrics
+        # ----------------------------------------------------
+
+        beta_change = abs(
+            beta_new
+            - beta_prev
+        )
+
+        u_change = np.linalg.norm(
+            u_new
+            - u
+        )
+
+        g_residual = abs(
+            g_new
+        )
+
+        # ----------------------------------------------------
+        # 12. Save current result
+        # ----------------------------------------------------
+
+        final_u = u_new.copy()
+        final_g = g_new
+
+        # ----------------------------------------------------
+        # 13. Convergence
+        #
+        # ALL THREE must pass.
+        # ----------------------------------------------------
+
+        if (
+            beta_change <= tol_beta
+            and
+            u_change <= tol_u
+            and
+            g_residual <= tol_g
+        ):
+
+            converged = True
+
+            x = x_new
+
+            beta_prev = beta_new
+
+            break
+
+        # ----------------------------------------------------
+        # 14. Continue
+        # ----------------------------------------------------
+
+        x = x_new
+
+        beta_prev = beta_new
+
+    # ========================================================
+    # DO NOT ACCEPT NON-CONVERGED FORM
+    # ========================================================
+
+    if not converged:
+
+        return {
+            "beta": None,
+            "Pf": None,
+            "converged": False,
+
+            "g_residual": (
+                float(abs(final_g))
+                if final_g is not None
+                else None
+            ),
+
+            "u_norm": (
+                float(
+                    np.linalg.norm(
+                        final_u
+                    )
+                )
+                if final_u is not None
+                else None
+            ),
+
+            "iterations": iteration_count
+        }
+
+    # ========================================================
+    # FORM FAILURE PROBABILITY
+    # ========================================================
+
+    beta_FORM = float(
+        beta_prev
+    )
+
+    Pf_FORM = float(
+        norm.cdf(
+            -beta_FORM
+        )
+    )
+
+    return {
+        "beta": beta_FORM,
+        "Pf": Pf_FORM,
+        "converged": True,
+
+        "g_residual": float(
+            abs(final_g)
+        ),
+
+        "u_norm": float(
+            np.linalg.norm(
+                final_u
+            )
+        ),
+
+        "iterations": iteration_count
+    }
+
+
+# ============================================================
+# MONTE CARLO
+# ============================================================
+
+def run_monte_carlo(
+    req
+):
+    """
+    Standard crude Monte Carlo.
+    """
+
+    rng = np.random.default_rng(
+        seed=42
+    )
+
+    # --------------------------------------------------------
+    # Sample variables
+    # --------------------------------------------------------
+
+    sampled = {
+        name: sample_variable(
+            spec,
+            req.N,
+            rng
+        )
+        for name, spec
+        in req.variables.items()
+    }
+
+    # --------------------------------------------------------
+    # Namespace
+    # --------------------------------------------------------
+
+    namespace = {
+        **sampled,
+        **req.fixed_params,
+        "t": req.timeStep_years
+    }
+
+    # --------------------------------------------------------
+    # Corrosion
+    # --------------------------------------------------------
+
+    if req.corrosion_formula:
+
+        namespace[
+            "degradation_factor"
+        ] = safe_eval_formula(
+            req.corrosion_formula,
+            namespace
+        )
+
+    else:
+
+        namespace[
+            "degradation_factor"
+        ] = 1.0
+
+    # --------------------------------------------------------
+    # Capacity
+    # --------------------------------------------------------
+
+    R = safe_eval_formula(
+        req.capacity_formula,
+        namespace
+    )
+
+    # --------------------------------------------------------
+    # Demand
+    # --------------------------------------------------------
+
+    E = safe_eval_formula(
+        req.demand_formula,
+        namespace
+    )
+
+    # --------------------------------------------------------
+    # Limit state
+    # --------------------------------------------------------
+
+    g = R - E
+
+    # --------------------------------------------------------
+    # Failure
+    # --------------------------------------------------------
+
+    n_fail = int(
+        np.sum(
+            g < 0
+        )
+    )
+
+    # --------------------------------------------------------
+    # Raw Monte Carlo Pf
+    # --------------------------------------------------------
+
+    raw_Pf = (
+        n_fail
+        / req.N
+    )
+
+    # --------------------------------------------------------
+    # Stabilized Pf for beta calculation
+    #
+    # This avoids +/- infinity when zero failures occur.
+    # --------------------------------------------------------
+
+    Pf = min(
+        max(
+            raw_Pf,
+            0.5 / req.N
+        ),
+        1.0 - 0.5 / req.N
+    )
+
+    # --------------------------------------------------------
+    # beta
+    # --------------------------------------------------------
+
+    beta = float(
+        -norm.ppf(
+            Pf
+        )
+    )
+
+    # --------------------------------------------------------
+    # COV of MC Pf estimator
+    # --------------------------------------------------------
+
+    cov_Pf = None
+
+    if (
+        raw_Pf > 0
+        and
+        raw_Pf < 1
+    ):
+
+        cov_Pf = float(
+            np.sqrt(
+                (
+                    1.0
+                    - raw_Pf
+                )
+                /
+                (
+                    raw_Pf
+                    * req.N
+                )
+            )
+        )
+
+    # --------------------------------------------------------
+    # Mean response
+    # --------------------------------------------------------
+
+    mean_R = float(
+        np.mean(R)
+    )
+
+    mean_E = float(
+        np.mean(E)
+    )
+
+    return {
+        "n_fail": n_fail,
+        "Pf": float(Pf),
+        "beta": beta,
+        "cov_Pf": cov_Pf,
+        "mean_capacity": mean_R,
+        "mean_demand": mean_E
+    }
+
+
+# ============================================================
+# MAIN RELIABILITY FUNCTION
+# ============================================================
+
+def run_reliability(
+    req
+):
+
+    if req.N <= 0:
+
+        raise HTTPException(
+            status_code=400,
+            detail="N must be greater than zero."
+        )
+
+    # ========================================================
+    # MONTE CARLO
+    # ========================================================
+
+    mc = run_monte_carlo(
+        req
+    )
+
+    # ========================================================
+    # FORM
+    # ========================================================
+
+    form = compute_form(
+        variables=req.variables,
+
+        fixed_params=req.fixed_params,
+
+        capacity_formula=req.capacity_formula,
+
+        demand_formula=req.demand_formula,
+
+        corrosion_formula=req.corrosion_formula,
+
+        t=req.timeStep_years
+    )
+
+    # ========================================================
+    # RESPONSE
+    # ========================================================
+
+    return ReliabilityResponse(
+
+        timeStep_years=req.timeStep_years,
+
+        N=req.N,
+
+        n_fail=mc[
+            "n_fail"
+        ],
+
+        Pf=mc[
+            "Pf"
+        ],
+
+        beta=mc[
+            "beta"
+        ],
+
+        cov_Pf=mc[
+            "cov_Pf"
+        ],
+
+        mean_capacity_kNm=mc[
+            "mean_capacity"
+        ],
+
+        mean_demand_kNm=mc[
+            "mean_demand"
+        ],
+
+        beta_FORM=form[
+            "beta"
+        ],
+
+        Pf_FORM=form[
+            "Pf"
+        ],
+
+        FORM_converged=form[
+            "converged"
+        ],
+
+        FORM_g_residual=form[
+            "g_residual"
+        ],
+
+        FORM_u_norm=form[
+            "u_norm"
+        ],
+
+        FORM_iterations=form[
+            "iterations"
+        ]
+    )
+
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.0.0"}
 
-
-@app.post("/reliability", response_model=ReliabilityResponse)
-def reliability_endpoint(req: ReliabilityRequest):
-    return run_reliability(req)
-
-
-# ── Unit tests (run with: python main.py --test) ─────────────────────────────
-
-def _run_unit_tests():
-    """
-    Quick sanity checks — called with 'python main.py --test'.
-    All must pass before deploying to Railway.
-    """
-    print("Running unit tests...")
-
-    # Test 1: Beta sign convention
-    assert abs(-norm.ppf(0.5))      < 1e-6,  "Phi_inv(0.5) must be 0"
-    assert abs(-norm.ppf(0.00025) - 3.481) < 0.001, "beta(Pf=0.00025) must be +3.481"
-    assert abs(-norm.ppf(0.99975) + 3.481) < 0.001, "beta(Pf=0.99975) must be -3.481"
-    print("  [1] Beta sign convention ✅")
-
-    # Test 2: Capacity formula units
-    # theta_R * A_p[mm²] * f_ps[MPa=N/mm²] * z[mm] / 1e6 → kNm
-    # 1.0 * 2000 * 1750 * 1160 / 1e6 = 4060 kNm
-    cap = 1.0 * 2000 * 1750 * 1160 / 1e6
-    assert abs(cap - 4060) < 1.0, f"Capacity formula unit check failed: {cap}"
-    print("  [2] Capacity formula units (z in mm, /1e6 → kNm) ✅")
-
-    # Test 3: Distribution means match spec
-    rng = np.random.default_rng(0)
-    for dist, mean, cov in [("normal",1000,0.05), ("lognormal",1750,0.025), ("gumbel",1.0,0.18)]:
-        spec = RandomVariableSpec(dist=dist, mean=mean, cov=cov)
-        s = sample_variable(spec, 2_000_000, rng)
-        err = abs(float(np.mean(s)) / mean - 1)
-        assert err < 0.005, f"{dist} mean error {err:.4f} > 0.5%"
-    print("  [3] Distribution mean accuracy (<0.5%) ✅")
-
-    # Test 4: Simple closed-form example
-    # g = R - E, R ~ N(5,1), E ~ N(3,1) → beta_exact = (5-3)/sqrt(2) ≈ 1.414
-    variables = {
-        "R": RandomVariableSpec(dist="normal", mean=5.0, cov=0.2),
-        "E": RandomVariableSpec(dist="normal", mean=3.0, cov=1/3),
+    return {
+        "status": "ok"
     }
-    req = ReliabilityRequest(
-        N=2_000_000,
-        timeStep_years=0.0,
-        capacity_formula="R",
-        demand_formula="E",
-        corrosion_formula=None,
-        variables=variables,
-        fixed_params={},
+
+
+# ============================================================
+# RELIABILITY ENDPOINT
+# ============================================================
+
+@app.post(
+    "/reliability",
+    response_model=ReliabilityResponse
+)
+def reliability_endpoint(
+    req: ReliabilityRequest
+):
+
+    return run_reliability(
+        req
     )
-    resp = run_reliability(req)
-    expected = (5 - 3) / np.sqrt(1**2 + 1**2)
-    assert abs(resp.governing_beta - expected) < 0.05, \
-        f"Simple test: governing_beta={resp.governing_beta:.3f}, expected≈{expected:.3f}"
-    print(f"  [4] Simple closed-form: beta={resp.governing_beta:.3f} (expect {expected:.3f}) ✅")
 
-    # Test 5: Corrosion reduces capacity monotonically
-    variables2 = {
-        "theta_R": RandomVariableSpec(dist="lognormal", mean=1.0,  cov=0.09),
-        "A_p":     RandomVariableSpec(dist="normal",    mean=2000, cov=0.015),
-        "f_ps":    RandomVariableSpec(dist="lognormal", mean=1750, cov=0.025),
-        "z":       RandomVariableSpec(dist="normal",    mean=1160, cov=0.03),
-        "B_D":     RandomVariableSpec(dist="lognormal", mean=1.05, cov=0.10),
-        "B_L":     RandomVariableSpec(dist="gumbel",    mean=1.00, cov=0.18),
-    }
-    betas = []
-    for t in [0, 20, 50]:
-        req2 = ReliabilityRequest(
-            N=200_000,
-            timeStep_years=float(t),
-            capacity_formula="theta_R * (A_p * degradation_factor) * f_ps * z / 1e6",
-            demand_formula="B_D * M_dead + B_L * M_live",
-            corrosion_formula="max(0.05, 1 - 0.005 * max(0, t - 15))",
-            variables=variables2,
-            fixed_params={"M_dead": 967.91, "M_live": 1072.63},
-        )
-        resp2 = run_reliability(req2)
-        betas.append(resp2.governing_beta)
-    assert betas[0] >= betas[1] >= betas[2], \
-        f"Beta must decrease monotonically: {betas}"
-    print(f"  [5] Corrosion monotonic: beta(t=0,20,50)={[round(b,2) for b in betas]} ✅")
 
-    print("\n✅ All unit tests passed.\n")
-
+# ============================================================
+# START SERVER
+# ============================================================
 
 if __name__ == "__main__":
-    import sys
-    if "--test" in sys.argv:
-        _run_unit_tests()
-    else:
-        import uvicorn
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000
+    )
